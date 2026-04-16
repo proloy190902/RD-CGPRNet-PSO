@@ -1,8 +1,8 @@
 # RD-CGPRNet-PSO
 
-GitHub-ready organized implementation of **RD-CGPRNet-PSO: RGB-D Cross-Scale Graph Prototype Refinement Network with PSO-based Heterogeneous Modal Fusion** for NYU Depth V2 few-shot RGB-D segmentation.
+**RD-CGPRNet-PSO: RGB-D Cross-Scale Graph Prototype Refinement Network with PSO-based Heterogeneous Modal Fusion** 
 
-This repository was organized from the user-provided single-file implementation. Source basis: fileciteturn0file0
+
 
 ## Repository Structure
 
