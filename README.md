@@ -80,16 +80,7 @@ git remote add origin <your-github-repo-url>
 git push -u origin main
 ```
 
-## Notes
 
-- I kept the architecture and logic close to the original one-file code.
-- I reorganized the code into reusable modules for easier maintenance and GitHub presentation.
-- Before public release, you may want to add:
-  - sample outputs
-  - training logs
-  - qualitative figures
-  - license
-  - citation block
 
 ## Original Single-File Source
 
