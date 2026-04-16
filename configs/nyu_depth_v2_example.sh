@@ -1,0 +1,1 @@
+python scripts/train.py   --data_root /path/to/nyu_data   --shot 1   --img_size 224   --backbone resnet50   --embed_dim 256   --hidden_dim 128   --num_iter 2   --epochs 50   --batch_size 8   --lr 1e-4   --weight_decay 1e-4   --num_workers 4   --save_dir ./checkpoints

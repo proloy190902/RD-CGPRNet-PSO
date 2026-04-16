@@ -1,0 +1,1019 @@
+"""
+╔══════════════════════════════════════════════════════════════════════════╗
+║  RD-CGPRNet-PSO                                                          ║
+║  RGB-D Cross-Scale Graph Prototype Refinement Network                    ║
+║  with PSO-based Heterogeneous Modal Fusion                               ║
+║                                                                          ║
+║  Dataset : NYU Depth V2                                                  ║
+║  Path    : /kaggle/input/datasets/soumikrakshit/nyu-depth-v2/nyu_data/  ║
+║                                                                          ║
+║  Kaggle Usage (new cell):                                                ║
+║    exec(open('rd_cgprnet_pso_nyu.py').read())                           ║
+╚══════════════════════════════════════════════════════════════════════════╝
+"""
+
+import os
+import csv
+import json
+import time
+import random
+import argparse
+import numpy as np
+from pathlib import Path
+from typing import List, Tuple, Optional, Dict
+from collections import defaultdict
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+from torchvision import transforms
+from torchvision.models import (resnet50, resnet101, vgg16,
+                                 ResNet50_Weights, ResNet101_Weights,
+                                 VGG16_Weights)
+from PIL import Image
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 1.  RGB ENCODER
+# ══════════════════════════════════════════════════════════════════════════
+
+class RGBEncoder(nn.Module):
+    def __init__(self, backbone='resnet50', out_channels=256):
+        super().__init__()
+        self.C = out_channels
+        in_dim = 512 if backbone == 'vgg16' else 2048
+
+        self.generic_branch = self._make_backbone(backbone)
+        self.task_branch    = self._make_backbone(backbone)
+        for p in self.generic_branch.parameters():
+            p.requires_grad = False
+
+        def proj(i, o):
+            return nn.Sequential(
+                nn.Conv2d(i, o, 1, bias=False),
+                nn.BatchNorm2d(o), nn.ReLU(inplace=True))
+
+        self.proj_gen  = proj(in_dim, out_channels)
+        self.proj_task = proj(in_dim, out_channels)
+        self.gate = nn.Sequential(
+            nn.Conv2d(out_channels * 2, out_channels, 1, bias=False),
+            nn.Sigmoid())
+
+    @staticmethod
+    def _make_backbone(name):
+        if name == 'resnet50':
+            m = resnet50(weights=ResNet50_Weights.IMAGENET1K_V1)
+            return nn.Sequential(*list(m.children())[:-2])
+        elif name == 'resnet101':
+            m = resnet101(weights=ResNet101_Weights.IMAGENET1K_V1)
+            return nn.Sequential(*list(m.children())[:-2])
+        elif name == 'vgg16':
+            return vgg16(weights=VGG16_Weights.IMAGENET1K_V1).features
+        raise ValueError(name)
+
+    def forward(self, x):
+        with torch.no_grad():
+            fg = self.generic_branch(x)
+        ft = self.task_branch(x)
+        fg = self.proj_gen(fg)
+        ft = self.proj_task(ft)
+        G  = self.gate(torch.cat([fg, ft], dim=1))
+        return G * ft + (1.0 - G) * fg
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 2.  DEPTH ENCODER
+# ══════════════════════════════════════════════════════════════════════════
+
+class DepthEncoder(nn.Module):
+    def __init__(self, out_channels=256):
+        super().__init__()
+        self.C = out_channels
+        # 5x stride-2: 224→112→56→28→14→7  (ResNet50 과 동일)
+        self.encoder = nn.Sequential(
+            nn.Conv2d(1,   32,  3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(32),  nn.ReLU(inplace=True),
+            nn.Conv2d(32,  64,  3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(64),  nn.ReLU(inplace=True),
+            nn.Conv2d(64,  128, 3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(128), nn.ReLU(inplace=True),
+            nn.Conv2d(128, 256, 3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(256), nn.ReLU(inplace=True),
+            nn.Conv2d(256, out_channels, 3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(out_channels), nn.ReLU(inplace=True),
+        )
+        self.depth_attn = nn.Sequential(
+            nn.Conv2d(out_channels, out_channels // 4, 1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_channels // 4, out_channels, 1),
+            nn.Sigmoid()
+        )
+
+    def forward(self, depth):
+        f = self.encoder(depth)
+        a = self.depth_attn(f)
+        return f * a
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 3.  MODALITY RELIABILITY ESTIMATOR
+# ══════════════════════════════════════════════════════════════════════════
+
+class ModalityReliabilityEstimator(nn.Module):
+    def __init__(self, in_channels=256):
+        super().__init__()
+        C = in_channels
+        self.net = nn.Sequential(
+            nn.Conv2d(C * 2, C,      1, bias=False),
+            nn.BatchNorm2d(C), nn.ReLU(inplace=True),
+            nn.Conv2d(C,     C // 2, 3, padding=1, bias=False),
+            nn.BatchNorm2d(C // 2), nn.ReLU(inplace=True),
+            nn.Conv2d(C // 2, 2,     1),
+        )
+
+    def forward(self, F_rgb, F_depth):
+        if F_depth.shape[-2:] != F_rgb.shape[-2:]:
+            F_depth = F.interpolate(F_depth, size=F_rgb.shape[-2:],
+                                    mode='bilinear', align_corners=False)
+        x = torch.cat([F_rgb, F_depth], dim=1)
+        x = self.net(x)
+        x = F.softmax(x, dim=1)
+        return x[:, 0:1], x[:, 1:2]
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 4.  PSO HETEROGENEOUS MODAL FUSION OPTIMIZER
+# ══════════════════════════════════════════════════════════════════════════
+
+class PSOModalFusionOptimizer:
+    def __init__(self, n_particles=30, n_iter=40,
+                 w=0.7, c1=1.5, c2=1.5, lambda_rel=0.3):
+        self.n_p = n_particles
+        self.n_i = n_iter
+        self.w   = w
+        self.c1  = c1
+        self.c2  = c2
+        self.lam = lambda_rel
+        self.dim = 6
+
+    @staticmethod
+    def _softmax2(a, b):
+        ea, eb = np.exp(a), np.exp(b)
+        s = ea + eb + 1e-8
+        return ea / s, eb / s
+
+    def _decode(self, particle):
+        w_rgb_fg, w_dep_fg = self._softmax2(particle[0], particle[1])
+        w_rgb_bg, w_dep_bg = self._softmax2(particle[2], particle[3])
+        return dict(rgb_fg=w_rgb_fg, dep_fg=w_dep_fg,
+                    rgb_bg=w_rgb_bg, dep_bg=w_dep_bg,
+                    scale=float(np.clip(particle[4], 0, 1)),
+                    proto=float(np.clip(particle[5], 0, 1)))
+
+    def _fitness(self, particles, rgb_sim, dep_sim, mask, r_rgb, r_depth):
+        scores  = np.zeros(self.n_p)
+        mn      = mask - mask.mean()
+        mn_norm = np.linalg.norm(mn) + 1e-8
+        for i in range(self.n_p):
+            p        = self._decode(particles[i])
+            fg_fused = p['rgb_fg'] * rgb_sim + p['dep_fg'] * dep_sim
+            bg_fused = p['rgb_bg'] * rgb_sim + p['dep_bg'] * dep_sim
+            fused    = mask * fg_fused + (1 - mask) * bg_fused
+            fn       = fused - fused.mean()
+            ncc      = (fn * mn).sum() / (np.linalg.norm(fn) * mn_norm + 1e-8)
+            rel_pen  = (p['dep_fg'] * (1 - r_depth) * mask).mean() + \
+                       (p['dep_bg'] * (1 - r_depth) * (1 - mask)).mean()
+            scores[i] = ncc - self.lam * rel_pen
+        return scores
+
+    def optimize(self, rgb_sim, dep_sim, query_mask, R_rgb, R_depth):
+        device = rgb_sim.device
+        h, w   = rgb_sim.shape[-2:]
+
+        def to_np(t):
+            return t.detach().float().mean(0).squeeze().cpu().numpy()
+
+        np_rgb  = to_np(rgb_sim)
+        np_dep  = to_np(dep_sim)
+        np_mask = to_np(F.interpolate(query_mask.float(),
+                                       size=(h, w), mode='nearest'))
+        np_r_rgb = to_np(R_rgb)
+        np_r_dep = to_np(R_depth)
+
+        pos    = np.random.uniform(-2, 2, (self.n_p, self.dim))
+        vel    = np.random.uniform(-0.5, 0.5, (self.n_p, self.dim))
+        pb_pos = pos.copy()
+        pb_fit = self._fitness(pos, np_rgb, np_dep,
+                               np_mask, np_r_rgb, np_r_dep)
+        gi     = pb_fit.argmax()
+        gb_pos = pb_pos[gi].copy()
+        gb_fit = pb_fit[gi]
+
+        for _ in range(self.n_i):
+            r1  = np.random.rand(self.n_p, self.dim)
+            r2  = np.random.rand(self.n_p, self.dim)
+            vel = (self.w * vel
+                   + self.c1 * r1 * (pb_pos - pos)
+                   + self.c2 * r2 * (gb_pos - pos))
+            pos = np.clip(pos + vel, -3.0, 3.0)
+            fit = self._fitness(pos, np_rgb, np_dep,
+                                np_mask, np_r_rgb, np_r_dep)
+            better         = fit > pb_fit
+            pb_pos[better] = pos[better]
+            pb_fit[better] = fit[better]
+            bi = pb_fit.argmax()
+            if pb_fit[bi] > gb_fit:
+                gb_pos = pb_pos[bi].copy()
+                gb_fit = pb_fit[bi]
+
+        best = self._decode(gb_pos)
+        return {k: torch.tensor(v, dtype=torch.float32, device=device)
+                for k, v in best.items()}
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 5.  MODAL FUSION MODULE
+# ══════════════════════════════════════════════════════════════════════════
+
+class ModalFusionModule(nn.Module):
+    def __init__(self, channels=256, use_pso=True,
+                 pso_particles=30, pso_iters=40):
+        super().__init__()
+        self.use_pso = use_pso
+        self.C       = channels
+        self.train_gate = nn.Sequential(
+            nn.Conv2d(channels * 2, channels, 1, bias=False),
+            nn.BatchNorm2d(channels), nn.ReLU(inplace=True),
+            nn.Conv2d(channels, channels, 1),
+        )
+        self.post_proj = nn.Sequential(
+            nn.Conv2d(channels, channels, 1, bias=False),
+            nn.BatchNorm2d(channels), nn.ReLU(inplace=True),
+        )
+        self.pso = PSOModalFusionOptimizer(
+            n_particles=pso_particles, n_iter=pso_iters)
+
+    def _compute_sim_maps(self, F_rgb, F_depth, proto_rgb, proto_dep):
+        def cos_sim(feat, proto):
+            p = F.normalize(proto, dim=1)[:, :, None, None]
+            f = F.normalize(feat,  dim=1)
+            return (f * p).sum(dim=1)
+        return cos_sim(F_rgb, proto_rgb), cos_sim(F_depth, proto_dep)
+
+    def forward(self, F_rgb, F_depth, R_rgb, R_depth,
+                proto_rgb, proto_dep, query_mask):
+        if self.use_pso and not self.training and \
+           query_mask is not None and \
+           proto_rgb is not None and proto_dep is not None:
+            rgb_sim, dep_sim = self._compute_sim_maps(
+                F_rgb, F_depth, proto_rgb, proto_dep)
+            pso_w  = self.pso.optimize(rgb_sim, dep_sim,
+                                       query_mask, R_rgb, R_depth)
+            F_fg   = pso_w['rgb_fg'] * F_rgb + pso_w['dep_fg'] * F_depth
+            F_bg   = pso_w['rgb_bg'] * F_rgb + pso_w['dep_bg'] * F_depth
+            proxy  = torch.sigmoid(
+                (rgb_sim + dep_sim).unsqueeze(1) * 3.0)
+            F_fused = proxy * F_fg + (1 - proxy) * F_bg
+        else:
+            F_fused = R_rgb * F_rgb + R_depth * F_depth
+            pso_w   = None
+        return self.post_proj(F_fused), pso_w
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 6.  CROSS-MODAL GRAPH PROTOTYPE GENERATOR
+# ══════════════════════════════════════════════════════════════════════════
+
+class CrossModalGPG(nn.Module):
+    def __init__(self, embed_dim=256, num_iter=2, hidden_dim=128):
+        super().__init__()
+        self.T     = num_iter
+        self.C     = embed_dim
+        self.scale = embed_dim ** -0.5
+
+        self.Q_proj = nn.Sequential(
+            nn.Linear(embed_dim * 2, embed_dim), nn.ReLU(inplace=True))
+        self.W_Q = nn.Linear(embed_dim, embed_dim, bias=False)
+        self.W_K = nn.Linear(embed_dim, embed_dim, bias=False)
+        self.W_V = nn.Linear(embed_dim, embed_dim, bias=False)
+
+        self.mlp_rgb = nn.ModuleList([
+            nn.Sequential(nn.Linear(embed_dim * 2 + 1, hidden_dim),
+                          nn.ReLU(inplace=True),
+                          nn.Linear(hidden_dim, embed_dim))
+            for _ in range(num_iter)])
+        self.mlp_dep = nn.ModuleList([
+            nn.Sequential(nn.Linear(embed_dim * 2 + 1, hidden_dim),
+                          nn.ReLU(inplace=True),
+                          nn.Linear(hidden_dim, embed_dim))
+            for _ in range(num_iter)])
+        self.refine_rgb = nn.Sequential(
+            nn.Linear(embed_dim, hidden_dim), nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, embed_dim))
+        self.refine_dep = nn.Sequential(
+            nn.Linear(embed_dim, hidden_dim), nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, embed_dim))
+
+    @staticmethod
+    def _map(feat, mask):
+        m   = F.interpolate(mask.float(), size=feat.shape[-2:], mode='nearest')
+        num = (feat * m).sum(dim=(-2, -1))
+        den = m.sum(dim=(-2, -1)).clamp(min=1e-5)
+        return num / den
+
+    @staticmethod
+    def _map_scalar(smap, mask):
+        m   = F.interpolate(mask.float(), size=smap.shape[-2:], mode='nearest')
+        num = (smap * m).sum(dim=(-2, -1))
+        den = m.sum(dim=(-2, -1)).clamp(min=1e-5)
+        return num / den
+
+    def forward(self, F_q_rgb, F_q_dep, supp_rgb, supp_dep,
+                supp_masks, R_rgb, R_depth):
+        B, C, h, w = F_q_rgb.shape
+        K = len(supp_rgb)
+
+        P_rgb = torch.stack(
+            [self._map(supp_rgb[k], supp_masks[k]) for k in range(K)], dim=1)
+        P_dep = torch.stack(
+            [self._map(supp_dep[k], supp_masks[k]) for k in range(K)], dim=1)
+        rel_rgb_k = torch.stack(
+            [self._map_scalar(R_rgb, supp_masks[k]) for k in range(K)], dim=1)
+        rel_dep_k = torch.stack(
+            [self._map_scalar(R_depth, supp_masks[k]) for k in range(K)], dim=1)
+
+        Qr = F_q_rgb.flatten(2).permute(0, 2, 1)
+        Qd = F_q_dep.flatten(2).permute(0, 2, 1)
+        Q  = self.Q_proj(torch.cat([Qr, Qd], dim=-1))
+
+        P_joint = (P_rgb + P_dep) / 2.0
+        A_last  = None
+
+        for t in range(self.T):
+            A      = F.softmax(
+                torch.bmm(self.W_Q(Q),
+                          self.W_K(P_joint).transpose(1, 2)) * self.scale,
+                dim=-1)
+            A_last = A
+            M      = torch.bmm(A.transpose(1, 2), Q)
+            P_rgb  = P_rgb + self.mlp_rgb[t](
+                torch.cat([P_rgb, M, rel_rgb_k], dim=-1)) * rel_rgb_k
+            P_dep  = P_dep + self.mlp_dep[t](
+                torch.cat([P_dep, M, rel_dep_k], dim=-1)) * rel_dep_k
+            P_joint = (P_rgb + P_dep) / 2.0
+
+        P_rgb_tilde = self.refine_rgb(P_rgb)
+        P_dep_tilde = self.refine_dep(P_dep)
+        F_q_att     = torch.bmm(A_last, self.W_V(P_joint)) \
+                           .permute(0, 2, 1).view(B, C, h, w)
+        return P_rgb_tilde, P_dep_tilde, F_q_att
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 7.  MULTI-SCALE MATCHING
+# ══════════════════════════════════════════════════════════════════════════
+
+class MultiScaleMatching(nn.Module):
+    def __init__(self, channels=256):
+        super().__init__()
+        def sc(k):
+            return nn.Sequential(
+                nn.Conv2d(channels, channels, k, padding=k//2, bias=False),
+                nn.BatchNorm2d(channels), nn.ReLU(inplace=True))
+        self.rgb_conv3 = sc(3); self.rgb_conv5 = sc(5); self.rgb_conv7 = sc(7)
+        self.dep_conv3 = sc(3); self.dep_conv5 = sc(5); self.dep_conv7 = sc(7)
+        self.alpha     = nn.Parameter(torch.zeros(3))
+
+    @staticmethod
+    def _cos(feat, proto):
+        p = F.normalize(proto, dim=1)[:, :, None, None]
+        return (F.normalize(feat, dim=1) * p).sum(dim=1)
+
+    def forward(self, F_q_rgb, F_q_dep, P_rgb_tilde, P_dep_tilde, w_proto=0.5):
+        B, K, C = P_rgb_tilde.shape
+        scale_maps = []
+        for rc, dc in [(self.rgb_conv3, self.dep_conv3),
+                       (self.rgb_conv5, self.dep_conv5),
+                       (self.rgb_conv7, self.dep_conv7)]:
+            Fr = rc(F_q_rgb); Fd = dc(F_q_dep)
+            S  = torch.zeros(B, *Fr.shape[-2:], device=F_q_rgb.device)
+            for k in range(K):
+                S += w_proto * self._cos(Fr, P_rgb_tilde[:, k]) + \
+                     (1 - w_proto) * self._cos(Fd, P_dep_tilde[:, k])
+            scale_maps.append(S / K)
+        w = F.softmax(self.alpha, dim=0)
+        return sum(w[r] * scale_maps[r] for r in range(3))
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 8.  SEGMENTATION DECODER
+# ══════════════════════════════════════════════════════════════════════════
+
+class SegmentationDecoder(nn.Module):
+    def __init__(self, channels=256):
+        super().__init__()
+        C = channels
+        self.net = nn.Sequential(
+            nn.Conv2d(C*2+1, C,      3, padding=1, bias=False),
+            nn.BatchNorm2d(C), nn.ReLU(inplace=True),
+            nn.Conv2d(C,     C//2,   3, padding=1, bias=False),
+            nn.BatchNorm2d(C//2), nn.ReLU(inplace=True),
+            nn.Conv2d(C//2,  1,      1),
+        )
+
+    def forward(self, F_fused, F_q_att, S_q, out_size):
+        x = torch.cat([F_fused, F_q_att, S_q.unsqueeze(1)], dim=1)
+        x = self.net(x)
+        x = F.interpolate(x, size=out_size, mode='bilinear', align_corners=False)
+        return torch.sigmoid(x).clamp(1e-7, 1 - 1e-7)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 9.  FULL MODEL
+# ══════════════════════════════════════════════════════════════════════════
+
+class RDCGPRNetPSO(nn.Module):
+    def __init__(self, backbone='resnet50', embed_dim=256,
+                 num_iter=2, hidden_dim=128, use_pso=True,
+                 pso_particles=30, pso_iters=40):
+        super().__init__()
+        C = embed_dim
+        self.rgb_encoder   = RGBEncoder(backbone, C)
+        self.depth_encoder = DepthEncoder(C)
+        self.mre           = ModalityReliabilityEstimator(C)
+        self.cm_gpg        = CrossModalGPG(C, num_iter, hidden_dim)
+        self.modal_fusion  = ModalFusionModule(C, use_pso,
+                                               pso_particles, pso_iters)
+        self.ms_match      = MultiScaleMatching(C)
+        self.decoder       = SegmentationDecoder(C)
+
+    def forward(self, query_rgb, query_depth, support_rgb,
+                support_depth, support_masks, query_mask=None):
+        H, W    = query_rgb.shape[-2:]
+        F_q_rgb = self.rgb_encoder(query_rgb)
+        F_q_dep = self.depth_encoder(query_depth)
+        F_s_rgb = [self.rgb_encoder(s)   for s in support_rgb]
+        F_s_dep = [self.depth_encoder(s) for s in support_depth]
+
+        R_rgb, R_depth = self.mre(F_q_rgb, F_q_dep)
+
+        P_rgb_tilde, P_dep_tilde, F_q_att = self.cm_gpg(
+            F_q_rgb, F_q_dep, F_s_rgb, F_s_dep,
+            support_masks, R_rgb, R_depth)
+
+        F_fused, pso_w = self.modal_fusion(
+            F_q_rgb, F_q_dep, R_rgb, R_depth,
+            P_rgb_tilde.mean(dim=1), P_dep_tilde.mean(dim=1),
+            query_mask)
+
+        w_proto = float(pso_w['proto'].item()) if pso_w else 0.5
+        S_q  = self.ms_match(F_q_rgb, F_q_dep,
+                              P_rgb_tilde, P_dep_tilde, w_proto)
+        pred = self.decoder(F_fused, F_q_att, S_q, (H, W))
+
+        return {'pred': pred, 'R_rgb': R_rgb,
+                'R_depth': R_depth, 'pso_weights': pso_w}
+
+    @staticmethod
+    def compute_loss(pred, target, R_rgb, R_depth):
+        L_seg     = F.binary_cross_entropy(pred, target.float())
+        target_ds = F.interpolate(target.float(),
+                                   size=R_depth.shape[-2:], mode='nearest')
+        L_rel     = F.binary_cross_entropy(R_depth, target_ds)
+        return L_seg + 0.1 * L_rel
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 10.  NYU DEPTH V2 DATASET
+# ══════════════════════════════════════════════════════════════════════════
+
+class NYUDepthV2Dataset(Dataset):
+    """
+    NYU Depth V2 Dataset Loader
+    ============================
+    Directory structure:
+        nyu_data/
+          data/
+            nyu2_train/
+              <scene_folder>/
+                *.jpg   ← RGB
+                *.png   ← Depth
+            nyu2_test/
+              <scene_folder>/
+                *.jpg
+                *.png
+          nyu2_train.csv   ← (rgb_path, depth_path) pairs
+          nyu2_test.csv
+
+    CSV format:
+        data/nyu2_train/scene/rgb.jpg, data/nyu2_train/scene/depth.png
+
+    Few-shot setup:
+        - scene folder name = class label
+        - episode: query + K support images from same scene class
+        - mask: depth threshold → near objects = foreground
+
+    Depth normalization:
+        NYU depth values are in meters (float PNG)
+        max depth ≈ 10.0m → depth_max=10.0
+    """
+
+    RGB_MEAN = [0.485, 0.456, 0.406]
+    RGB_STD  = [0.229, 0.224, 0.225]
+
+    def __init__(
+        self,
+        root                 : str,
+        shot                 : int   = 1,
+        img_size             : int   = 224,
+        split                : str   = 'train',
+        depth_max            : float = 10.0,
+        depth_fg_threshold   : float = 0.4,
+        min_images_per_class : int   = 5,
+        seed                 : int   = 42,
+    ):
+        self.root              = Path(root)
+        self.shot              = shot
+        self.img_size          = img_size
+        self.split             = split
+        self.depth_max         = depth_max
+        self.depth_fg_thr      = depth_fg_threshold
+        self.min_img_per_class = min_images_per_class
+
+        self.rgb_tf = transforms.Compose([
+            transforms.Resize((img_size, img_size)),
+            transforms.ToTensor(),
+            transforms.Normalize(self.RGB_MEAN, self.RGB_STD),
+        ])
+
+        # ── CSV থেকে pairs load করো ────────────────────────────────
+        csv_name = f'nyu2_{split}.csv'
+        csv_path = self.root / csv_name
+        if not csv_path.exists():
+            # nyu_data/ 안에 있을 수도 있음
+            csv_path = self.root / 'data' / csv_name
+        if not csv_path.exists():
+            raise FileNotFoundError(f"CSV not found: {csv_path}")
+
+        self.pairs = self._load_csv(csv_path)
+        print(f"  [NYUDepthV2] Loaded {len(self.pairs)} pairs from {csv_name}")
+
+        # ── scene name = class label ────────────────────────────────
+        # path: data/nyu2_train/living_room_0001/rgb_00001.jpg
+        # scene = living_room_0001 → class = living_room
+        self.class_map = self._build_class_map()
+
+        # ── episodes ───────────────────────────────────────────────
+        self.episodes = self._build_episodes()
+
+        print(f"  [NYUDepthV2] split='{split}' | "
+              f"pairs={len(self.pairs)} | "
+              f"classes={len(self.class_map)} | "
+              f"episodes={len(self.episodes)} | shot={shot}")
+
+    def _load_csv(self, csv_path: Path) -> List[Tuple[Path, Path]]:
+        pairs = []
+        with open(csv_path, newline='') as f:
+            reader = csv.reader(f)
+            for row in reader:
+                if len(row) < 2:
+                    continue
+                rgb_rel   = row[0].strip()
+                depth_rel = row[1].strip()
+                rgb_path   = self.root / rgb_rel
+                depth_path = self.root / depth_rel
+                # fallback: nyu_data/ prefix
+                if not rgb_path.exists():
+                    rgb_path   = self.root / 'data' / rgb_rel
+                    depth_path = self.root / 'data' / depth_rel
+                if rgb_path.exists():
+                    pairs.append((rgb_path, depth_path))
+        return pairs
+
+    def _get_class(self, rgb_path: Path) -> str:
+        """
+        path: .../nyu2_train/living_room_0001/rgb_00001.jpg
+        scene folder = living_room_0001
+        class = living_room (숫자 제거)
+        """
+        scene = rgb_path.parent.name          # living_room_0001
+        # 마지막 _숫자 제거
+        parts = scene.rsplit('_', 1)
+        if len(parts) == 2 and parts[1].isdigit():
+            return parts[0]                   # living_room
+        return scene
+
+    def _build_class_map(self) -> Dict[str, List[int]]:
+        cls_map: Dict[str, List[int]] = defaultdict(list)
+        for i, (rgb_path, _) in enumerate(self.pairs):
+            cls = self._get_class(rgb_path)
+            cls_map[cls].append(i)
+        return {
+            cls: idxs for cls, idxs in cls_map.items()
+            if len(idxs) >= self.min_img_per_class
+        }
+
+    def _build_episodes(self) -> List[Dict]:
+        episodes = []
+        for cls, idxs in self.class_map.items():
+            for qi in idxs:
+                pool = [i for i in idxs if i != qi]
+                if len(pool) >= self.shot:
+                    episodes.append({
+                        'class'  : cls,
+                        'query'  : qi,
+                        'support': pool[:self.shot],
+                    })
+        return episodes
+
+    # ── loaders ────────────────────────────────────────────────────
+
+    def _load_rgb(self, idx: int) -> torch.Tensor:
+        path = self.pairs[idx][0]
+        return self.rgb_tf(Image.open(path).convert('RGB'))
+
+    def _load_depth(self, idx: int) -> torch.Tensor:
+        path = self.pairs[idx][1]
+        try:
+            dep = Image.open(path)
+            dep = dep.resize((self.img_size, self.img_size), Image.NEAREST)
+            arr = np.array(dep, dtype=np.float32)
+
+            # NYU depth: uint16 PNG (값이 크면 /65535 * depth_max)
+            # 또는 float32 PNG
+            if arr.max() > 100:
+                arr = arr / 65535.0 * self.depth_max
+            arr = arr / self.depth_max
+            arr = np.clip(arr, 0.0, 1.0)
+
+            if arr.ndim == 3:
+                arr = arr[:, :, 0]
+            return torch.from_numpy(arr).unsqueeze(0)
+        except Exception as e:
+            print(f"  [Depth Warning] {path.name}: {e}")
+            return torch.zeros(1, self.img_size, self.img_size)
+
+    def _depth_to_mask(self, depth_tensor: torch.Tensor) -> torch.Tensor:
+        """
+        Depth threshold → binary mask
+        NYU: 낮은 depth값 = 카메라에 가까운 object = foreground
+        """
+        mask = (depth_tensor < self.depth_fg_thr).float()
+        # foreground 가 너무 적거나 많으면 Otsu-style threshold 재조정
+        fg = mask.mean().item()
+        if fg < 0.05 or fg > 0.95:
+            # depth histogram 기반 adaptive threshold
+            arr  = depth_tensor.squeeze().numpy()
+            vals = arr[arr > 0]
+            if len(vals) > 0:
+                thr  = float(np.percentile(vals, 35))
+                mask = (depth_tensor < thr).float()
+        return mask
+
+    def __len__(self):
+        return len(self.episodes)
+
+    def __getitem__(self, idx: int) -> Dict:
+        ep = self.episodes[idx]
+
+        q_rgb   = self._load_rgb(ep['query'])
+        q_depth = self._load_depth(ep['query'])
+        q_mask  = self._depth_to_mask(q_depth)
+
+        s_rgbs, s_depths, s_masks = [], [], []
+        for si in ep['support']:
+            sr = self._load_rgb(si)
+            sd = self._load_depth(si)
+            sm = self._depth_to_mask(sd)
+            s_rgbs.append(sr)
+            s_depths.append(sd)
+            s_masks.append(sm)
+
+        return {
+            'query_rgb'    : q_rgb,
+            'query_depth'  : q_depth,
+            'query_mask'   : q_mask,
+            'support_rgb'  : torch.stack(s_rgbs),
+            'support_depth': torch.stack(s_depths),
+            'support_masks': torch.stack(s_masks),
+            'class'        : ep['class'],
+        }
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 11.  METRICS
+# ══════════════════════════════════════════════════════════════════════════
+
+class Metrics:
+    @staticmethod
+    def iou(pred, target, thr=0.5):
+        pb = (pred > thr).float()
+        i  = (pb * target).sum(dim=(-2, -1))
+        u  = pb.add(target).clamp(max=1).sum(dim=(-2, -1))
+        return (i / (u + 1e-8)).mean().item()
+
+    @staticmethod
+    def dice(pred, target, thr=0.5):
+        pb = (pred > thr).float()
+        i  = (pb * target).sum(dim=(-2, -1))
+        return (2*i / (pb.sum(dim=(-2,-1)) +
+                       target.sum(dim=(-2,-1)) + 1e-8)).mean().item()
+
+    @staticmethod
+    def fb_iou(pred, target, thr=0.5):
+        return (Metrics.iou(pred, target, thr) +
+                Metrics.iou(1-pred, 1-target, thr)) / 2.0
+
+    @staticmethod
+    def precision(pred, target, thr=0.5):
+        pb = (pred > thr).float()
+        tp = (pb * target).sum(dim=(-2, -1))
+        fp = (pb * (1-target)).sum(dim=(-2, -1))
+        return (tp / (tp + fp + 1e-8)).mean().item()
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 12.  TRAINER
+# ══════════════════════════════════════════════════════════════════════════
+
+class Trainer:
+    def __init__(self, model: RDCGPRNetPSO, args):
+        self.model  = model
+        self.args   = args
+        self.device = next(model.parameters()).device
+
+        trainable = [p for n, p in model.named_parameters()
+                     if 'generic_branch' not in n and p.requires_grad]
+        self.opt   = optim.AdamW(trainable, lr=args.lr,
+                                  weight_decay=args.weight_decay)
+        self.sched = optim.lr_scheduler.CosineAnnealingLR(
+                         self.opt, T_max=args.epochs)
+        os.makedirs(args.save_dir, exist_ok=True)
+
+    def _unpack(self, batch):
+        dev = self.device
+        K   = batch['support_rgb'].shape[1]
+        return (
+            batch['query_rgb'].to(dev),
+            batch['query_depth'].to(dev),
+            batch['query_mask'].to(dev),
+            [batch['support_rgb'][:, k].to(dev)   for k in range(K)],
+            [batch['support_depth'][:, k].to(dev) for k in range(K)],
+            [batch['support_masks'][:, k].to(dev) for k in range(K)],
+        )
+
+    def train_epoch(self, loader, epoch):
+        self.model.train()
+        losses, ious = [], []
+        for step, batch in enumerate(loader):
+            q_rgb, q_dep, q_msk, s_rgb, s_dep, s_msk = self._unpack(batch)
+            self.opt.zero_grad()
+            out  = self.model(q_rgb, q_dep, s_rgb, s_dep, s_msk)
+            loss = RDCGPRNetPSO.compute_loss(
+                out['pred'], q_msk, out['R_rgb'], out['R_depth'])
+            loss.backward()
+            nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+            self.opt.step()
+            losses.append(loss.item())
+            ious.append(Metrics.iou(out['pred'].detach(), q_msk))
+            if step % 50 == 0:
+                print(f"  Ep{epoch:3d} | step{step:4d} | "
+                      f"loss {loss.item():.4f} | iou {ious[-1]:.4f}")
+        self.sched.step()
+        return {'loss': np.mean(losses), 'iou': np.mean(ious)}
+
+    @torch.no_grad()
+    def evaluate(self, loader):
+        self.model.eval()
+        ious, dices, fbs, precs = [], [], [], []
+        for batch in loader:
+            q_rgb, q_dep, q_msk, s_rgb, s_dep, s_msk = self._unpack(batch)
+            out  = self.model(q_rgb, q_dep, s_rgb, s_dep, s_msk,
+                              query_mask=q_msk)
+            pred = out['pred']
+            ious.append(Metrics.iou(pred, q_msk))
+            dices.append(Metrics.dice(pred, q_msk))
+            fbs.append(Metrics.fb_iou(pred, q_msk))
+            precs.append(Metrics.precision(pred, q_msk))
+        return {'iou' : np.mean(ious),  'dice': np.mean(dices),
+                'fb'  : np.mean(fbs),   'prec': np.mean(precs)}
+
+    def run(self, train_loader, val_loader):
+        best_iou = 0.0
+        print(f"\n{'='*60}")
+        print(f"  RD-CGPRNet-PSO | {self.args.backbone} | "
+              f"{self.args.shot}-shot")
+        print(f"{'='*60}\n")
+        for epoch in range(1, self.args.epochs + 1):
+            tr = self.train_epoch(train_loader, epoch)
+            vl = self.evaluate(val_loader)
+            print(f"\n  Ep{epoch:3d}/{self.args.epochs} | "
+                  f"loss={tr['loss']:.4f} iou={tr['iou']:.4f} | "
+                  f"val iou={vl['iou']:.4f} dice={vl['dice']:.4f} "
+                  f"fb={vl['fb']:.4f} prec={vl['prec']:.4f}")
+            if vl['iou'] > best_iou:
+                best_iou = vl['iou']
+                ckpt = os.path.join(
+                    self.args.save_dir,
+                    f"best_{self.args.backbone}_{self.args.shot}shot.pth")
+                torch.save({'epoch'     : epoch,
+                            'state_dict': self.model.state_dict(),
+                            'val'       : vl,
+                            'args'      : vars(self.args)}, ckpt)
+                print(f"  ✓ Best → {ckpt}  (iou={best_iou:.4f})")
+        print(f"\n  Done. Best IoU = {best_iou:.4f}\n")
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 13.  ABLATION
+# ══════════════════════════════════════════════════════════════════════════
+
+class AblationRunner:
+    CONFIGS = {
+        'Full RD-CGPRNet-PSO'        : dict(use_pso=True,  num_iter=2),
+        'w/o PSO (MRE weights only)' : dict(use_pso=False, num_iter=2),
+        'w/o Graph Refine'           : dict(use_pso=True,  num_iter=0),
+    }
+
+    def __init__(self, args, val_loader, device):
+        self.args   = args
+        self.loader = val_loader
+        self.device = device
+
+    @torch.no_grad()
+    def _eval(self, model):
+        model.eval()
+        ious, dices, fbs = [], [], []
+        for batch in self.loader:
+            dev   = self.device
+            K     = batch['support_rgb'].shape[1]
+            q_rgb = batch['query_rgb'].to(dev)
+            q_dep = batch['query_depth'].to(dev)
+            q_msk = batch['query_mask'].to(dev)
+            s_rgb = [batch['support_rgb'][:, k].to(dev)   for k in range(K)]
+            s_dep = [batch['support_depth'][:, k].to(dev) for k in range(K)]
+            s_msk = [batch['support_masks'][:, k].to(dev) for k in range(K)]
+            out   = model(q_rgb, q_dep, s_rgb, s_dep, s_msk, query_mask=q_msk)
+            ious.append(Metrics.iou(out['pred'], q_msk))
+            dices.append(Metrics.dice(out['pred'], q_msk))
+            fbs.append(Metrics.fb_iou(out['pred'], q_msk))
+        return np.mean(ious), np.mean(dices), np.mean(fbs)
+
+    def run(self, checkpoint_path):
+        print(f"\n{'='*65}\n  ABLATION STUDY\n{'='*65}")
+        print(f"  {'Config':<32} {'mIoU':>8} {'Dice':>8} {'FB-IoU':>8}  {'Δ':>8}")
+        print("  " + "-"*65)
+        base_iou = None
+        ckpt     = torch.load(checkpoint_path, map_location=self.device)
+        for name, cfg in self.CONFIGS.items():
+            model = RDCGPRNetPSO(
+                backbone  = self.args.backbone,
+                embed_dim = self.args.embed_dim,
+                num_iter  = cfg['num_iter'],
+                hidden_dim= self.args.hidden_dim,
+                use_pso   = cfg['use_pso'],
+            ).to(self.device)
+            model.load_state_dict(ckpt['state_dict'], strict=False)
+            mi, md, mf = self._eval(model)
+            if base_iou is None:
+                base_iou = mi
+            d  = mi - base_iou
+            ds = "  base" if d == 0 else f"{d:>+8.4f}"
+            print(f"  {name:<32} {mi:>8.4f} {md:>8.4f} {mf:>8.4f}  {ds}")
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 14.  ENTRY POINT
+# ══════════════════════════════════════════════════════════════════════════
+
+def _auto_detect_data_root() -> str:
+    """NYU Depth V2 data root 자동 탐색."""
+    candidates = [
+        '/kaggle/input/datasets/soumikrakshit/nyu-depth-v2/nyu_data',
+        '/kaggle/input/nyu-depth-v2/nyu_data',
+        '/content/nyu_data',
+        './data/nyu_data',
+    ]
+    for c in candidates:
+        if Path(c).exists():
+            print(f"  [Auto-detect] data_root = '{c}'")
+            return c
+
+    # 일반적인 탐색
+    for base in ['/kaggle/input', '/content', '.']:
+        if not os.path.exists(base):
+            continue
+        for root, dirs, files in os.walk(base):
+            if any(f.endswith('.csv') and 'nyu2' in f for f in files):
+                print(f"  [Auto-detect] data_root = '{root}'")
+                return root
+            if root.count(os.sep) - base.count(os.sep) > 4:
+                dirs.clear()
+    return './data'
+
+
+def build_args():
+    p = argparse.ArgumentParser(description='RD-CGPRNet-PSO | NYU Depth V2')
+    p.add_argument('--data_root',     default=None)
+    p.add_argument('--shot',          type=int,   default=1)
+    p.add_argument('--img_size',      type=int,   default=224)
+    p.add_argument('--depth_max',     type=float, default=10.0)
+    p.add_argument('--depth_fg_thr',  type=float, default=0.4)
+    p.add_argument('--backbone',      default='resnet50',
+                   choices=['resnet50', 'resnet101', 'vgg16'])
+    p.add_argument('--embed_dim',     type=int,   default=256)
+    p.add_argument('--hidden_dim',    type=int,   default=128)
+    p.add_argument('--num_iter',      type=int,   default=2)
+    p.add_argument('--use_pso',       action='store_true', default=True)
+    p.add_argument('--pso_particles', type=int,   default=30)
+    p.add_argument('--pso_iters',     type=int,   default=40)
+    p.add_argument('--mode',          default='train',
+                   choices=['train', 'eval', 'ablation'])
+    p.add_argument('--epochs',        type=int,   default=50)
+    p.add_argument('--batch_size',    type=int,   default=8)
+    p.add_argument('--lr',            type=float, default=1e-4)
+    p.add_argument('--weight_decay',  type=float, default=1e-4)
+    p.add_argument('--num_workers',   type=int,   default=4)
+    p.add_argument('--save_dir',      default='/kaggle/working/checkpoints')
+    p.add_argument('--checkpoint',    default=None)
+    args, _ = p.parse_known_args()
+    if args.data_root is None:
+        args.data_root = _auto_detect_data_root()
+    return args
+
+
+def main():
+    args   = build_args()
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+    print(f"\n{'='*60}")
+    print(f"  RD-CGPRNet-PSO  |  NYU Depth V2")
+    print(f"{'='*60}")
+    print(f"  Device    : {device}")
+    print(f"  data_root : {args.data_root}")
+    print(f"  backbone  : {args.backbone}")
+    print(f"  shot      : {args.shot}")
+    print(f"  mode      : {args.mode}\n")
+
+    # ── Dataset ───────────────────────────────────────────────────
+    train_ds = NYUDepthV2Dataset(
+        root                 = args.data_root,
+        shot                 = args.shot,
+        img_size             = args.img_size,
+        split                = 'train',
+        depth_max            = args.depth_max,
+        depth_fg_threshold   = args.depth_fg_thr,
+    )
+    val_ds = NYUDepthV2Dataset(
+        root                 = args.data_root,
+        shot                 = args.shot,
+        img_size             = args.img_size,
+        split                = 'test',        # NYU uses test (not val)
+        depth_max            = args.depth_max,
+        depth_fg_threshold   = args.depth_fg_thr,
+    )
+
+    train_loader = DataLoader(
+        train_ds, batch_size=args.batch_size, shuffle=True,
+        num_workers=args.num_workers, pin_memory=True, drop_last=True)
+    val_loader = DataLoader(
+        val_ds, batch_size=args.batch_size, shuffle=False,
+        num_workers=args.num_workers, pin_memory=True)
+
+    # ── Model ─────────────────────────────────────────────────────
+    model = RDCGPRNetPSO(
+        backbone      = args.backbone,
+        embed_dim     = args.embed_dim,
+        num_iter      = args.num_iter,
+        hidden_dim    = args.hidden_dim,
+        use_pso       = args.use_pso,
+        pso_particles = args.pso_particles,
+        pso_iters     = args.pso_iters,
+    ).to(device)
+
+    total     = sum(p.numel() for p in model.parameters())
+    trainable = sum(p.numel() for p in model.parameters()
+                    if p.requires_grad)
+    print(f"  Parameters : {total:,}  (trainable: {trainable:,})\n")
+
+    # ── Mode ──────────────────────────────────────────────────────
+    if args.mode == 'train':
+        Trainer(model, args).run(train_loader, val_loader)
+
+    elif args.mode == 'eval':
+        assert args.checkpoint, "--checkpoint required"
+        ckpt = torch.load(args.checkpoint, map_location=device)
+        model.load_state_dict(ckpt['state_dict'])
+        res = Trainer(model, args).evaluate(val_loader)
+        print(f"\n  mIoU={res['iou']:.4f}  Dice={res['dice']:.4f}  "
+              f"FB-IoU={res['fb']:.4f}  Prec={res['prec']:.4f}\n")
+
+    elif args.mode == 'ablation':
+        assert args.checkpoint, "--checkpoint required"
+        AblationRunner(args, val_loader, device).run(args.checkpoint)
+
+
+if __name__ == '__main__':
+    main()
