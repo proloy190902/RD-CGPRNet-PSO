@@ -6,7 +6,7 @@
 
 The overall architecture of **RD-CGPRNet-PSO** is illustrated below. The model integrates RGB-D feature extraction, modality reliability estimation, cross-modal graph prototype learning, PSO-based adaptive fusion, and multi-scale matching for robust segmentation.
 
-![Architecture](https://github.com/proloy190902/CGPRNet/blob/de919e29b1f674e3c26e73bccec5e4a4e33235aa/CGPRNet%20Architecture.png)
+![Architecture](https://github.com/proloy190902/RD-CGPRNet-PSO/blob/52f32c310564884ff10f1ec1e9e05f3b650509e7/RD-CGPRNet_PSO.png)
 
 ## Repository Structure
 
