@@ -2,7 +2,13 @@
 
 **RD-CGPRNet-PSO: RGB-D Cross-Scale Graph Prototype Refinement Network with PSO-based Heterogeneous Modal Fusion** 
 
+## 🧠 Framework Overview
 
+The overall architecture of **RD-CGPRNet-PSO** is illustrated below. The model integrates RGB-D feature extraction, modality reliability estimation, cross-modal graph prototype learning, PSO-based adaptive fusion, and multi-scale matching for robust segmentation.
+
+<p align="center">
+  <img src="assets/architecture.png" width="100%">
+</p>
 
 ## Repository Structure
 
